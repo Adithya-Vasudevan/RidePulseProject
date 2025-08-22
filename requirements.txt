@@ -1,0 +1,22 @@
+# RidePulse - Streamlit App Requirements
+# Core Streamlit and data processing
+streamlit>=1.33,<2
+pandas>=2.0,<3
+numpy>=1.24,<3
+
+# Visualization
+plotly>=5.20,<6
+pydeck>=0.8,<1
+
+# Machine Learning
+scikit-learn>=1.3,<2
+
+# Data handling
+pyarrow>=15,<20
+
+# Network requests
+requests>=2.31,<3
+
+# Streamlit enhancements
+streamlit-lottie>=0.0.5,<0.1
+streamlit-plotly-events>=0.0.6,<0.1

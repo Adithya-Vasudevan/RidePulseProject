@@ -1,0 +1,15 @@
+[theme]
+# Theme configuration for RidePulse app
+primaryColor = "#10b981"        # Emerald - matches existing app colors
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f0f2f6"
+textColor = "#262730"
+
+[server]
+# Server configuration
+runOnSave = true
+allowRunOnSave = true
+
+[browser]
+# Browser configuration
+gatherUsageStats = false
