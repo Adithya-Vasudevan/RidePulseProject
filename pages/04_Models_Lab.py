@@ -254,15 +254,30 @@ with tab_cls:
     if metrics_text:
         st.info(f"Validation metrics on hold-out: {metrics_text}")
 
-    # Table of top stations needing attention
+    # Table of top stations needing attention (with friendly labels)
     out_tbl = feat[["name", "percent_full", "capacity", "bikes", "docks"]].copy()
     out_tbl["need_rebalance"] = pred_now.astype(int)
     out_tbl["score"] = np.round(score_now, 3)
-    need_now = out_tbl.sort_values(["need_rebalance", "score"], ascending=[False, False])
+    need_now = out_tbl.sort_values(["need_rebalance", "score"], ascending=[False, False]).reset_index(drop=True)
 
     st.markdown("##### Stations ranked by rebalancing need")
+    tbl = need_now.copy()
+    # Round percent and keep numeric for sorting
+    tbl["percent_full"] = pd.to_numeric(tbl["percent_full"], errors="coerce").round(1)
+    # Friendlier boolean label
+    tbl["need_rebalance"] = tbl["need_rebalance"].map({1: "Yes", 0: "No"})
+    colmap_need = {
+        "name": "Station",
+        "percent_full": "% Full",
+        "capacity": "Capacity",
+        "bikes": "Bikes",
+        "docks": "Docks",
+        "need_rebalance": "Needs attention",
+        "score": "Score",
+    }
+    display_need = tbl if show_names else tbl.drop(columns=["name"])
     st.dataframe(
-        need_now if show_names else need_now.drop(columns=["name"]),
+        display_need.rename(columns=colmap_need),
         use_container_width=True,
         hide_index=True,
     )
@@ -331,13 +346,29 @@ with tab_cluster:
         )
         st.plotly_chart(_apply_theme(fig_cluster), use_container_width=True, theme="streamlit")
 
-        # Cluster summaries (flatten multi-index columns)
+        # Cluster summaries (flatten multi-index columns) with friendlier headers
         st.markdown("##### Cluster summaries")
         cols_for_summary = ["capacity", "percent_full", "bikes_per_cap", "docks_per_cap", "nn_percent_full_mean"]
         summary = feat.groupby("cluster")[cols_for_summary].agg(["count", "mean", "median"])
         summary.columns = [f"{col}_{stat}" for col, stat in summary.columns]  # flatten
         summary = summary.reset_index()
-        st.dataframe(summary, use_container_width=True, hide_index=True)
+
+        metric_labels = {
+            "capacity": "Capacity",
+            "percent_full": "% Full",
+            "bikes_per_cap": "Bikes/Cap",
+            "docks_per_cap": "Docks/Cap",
+            "nn_percent_full_mean": "Neighbor % Full",
+        }
+        stat_labels = {"count": "n", "mean": "avg", "median": "median"}
+        rename_map = {"cluster": "Cluster"}
+        for base in cols_for_summary:
+            for stat in ["count", "mean", "median"]:
+                key = f"{base}_{stat}"
+                if key in summary.columns:
+                    rename_map[key] = f"{metric_labels.get(base, base)} ({stat_labels.get(stat, stat)})"
+
+        st.dataframe(summary.rename(columns=rename_map), use_container_width=True, hide_index=True)
 
     except ImportError:
         st.warning("scikit-learn not found. Install with: pip install scikit-learn")
@@ -385,11 +416,31 @@ with tab_anom:
             ["Scores are relative to current data", "Sensitive to feature scaling"],
         )
 
-        top_anom = feat.sort_values("anomaly_score", ascending=False).head(15)
+        top_anom = feat.sort_values("anomaly_score", ascending=False).head(15).reset_index(drop=True)
         st.markdown("##### Top anomalies")
+
+        # Friendlier headers and formatting
         cols_show = ["name", "percent_full", "capacity", "bikes", "docks", "nn_percent_full_mean", "anomaly_score"]
-        st.dataframe(top_anom[cols_show] if show_names else top_anom[[c for c in cols_show if c != "name"]],
-                     use_container_width=True, hide_index=True)
+        anom_tbl = top_anom[cols_show].copy()
+        anom_tbl["percent_full"] = pd.to_numeric(anom_tbl["percent_full"], errors="coerce").round(1)
+        anom_tbl["nn_percent_full_mean"] = pd.to_numeric(anom_tbl["nn_percent_full_mean"], errors="coerce").round(1)
+        anom_tbl["anomaly_score"] = pd.to_numeric(anom_tbl["anomaly_score"], errors="coerce").round(3)
+
+        colmap_anom = {
+            "name": "Station",
+            "percent_full": "% Full",
+            "capacity": "Capacity",
+            "bikes": "Bikes",
+            "docks": "Docks",
+            "nn_percent_full_mean": "Neighbor % Full (avg)",
+            "anomaly_score": "Anomaly score",
+        }
+        display_anom = anom_tbl if show_names else anom_tbl.drop(columns=["name"])
+        st.dataframe(
+            display_anom.rename(columns=colmap_anom),
+            use_container_width=True,
+            hide_index=True,
+        )
 
         fig_anom = px.scatter(
             feat,

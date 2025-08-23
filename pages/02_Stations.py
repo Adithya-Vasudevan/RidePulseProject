@@ -55,8 +55,14 @@ with left:
         st.caption(f"Last reported (provider): {row.get('last_reported', '')}")
 
         comp = pd.DataFrame({"Type": ["Bikes", "Docks"], "Count": [bikes, docks]})
-        fig = px.pie(comp, values="Count", names="Type", title="Composition", hole=0.45,
-                     color_discrete_sequence=["#2563eb", "#10b981"])
+        fig = px.pie(
+            comp,
+            values="Count",
+            names="Type",
+            title="Composition",
+            hole=0.45,
+            color_discrete_sequence=["#2563eb", "#10b981"],
+        )
         st.plotly_chart(fig, use_container_width=True)
 
 with right:
@@ -80,11 +86,55 @@ with right:
     else:
         st.info("Select a station to view its location and details.")
 
+# --- Table ---
 st.markdown("### Table")
-show_cols = ["name", "num_bikes_available", "num_docks_available", "capacity", "percent_full", "last_reported", "lat", "lon"]
+
+show_cols = [
+    "name",
+    "num_bikes_available",
+    "num_docks_available",
+    "capacity",
+    "percent_full",
+    "last_reported",
+    "lat",
+    "lon",
+]
+
+# Ensure missing columns exist
 for c in show_cols:
     if c not in flt.columns:
         flt[c] = pd.NA
+
 tbl = flt[show_cols].copy()
-tbl["percent_full"] = (tbl["percent_full"].fillna(0) * 100).round(1)
-st.dataframe(tbl.rename(columns={"percent_full": "% Full"}), use_container_width=True, height=420)
+
+# % full as 0-100 with one decimal (kept numeric so sorting still works)
+tbl["percent_full"] = (pd.to_numeric(tbl["percent_full"], errors="coerce").fillna(0) * 100).round(1)
+
+# Friendly timestamp for last_reported when possible
+if "last_reported" in tbl.columns:
+    lr = tbl["last_reported"]
+    if pd.api.types.is_numeric_dtype(lr):
+        lr = pd.to_datetime(lr, unit="s", errors="coerce")
+    else:
+        lr = pd.to_datetime(lr, errors="coerce")
+    # Format to local-like string without seconds
+    tbl["last_reported"] = lr.dt.strftime("%Y-%m-%d %H:%M")
+
+# Human-friendly column labels
+colmap = {
+    "name": "Station",
+    "num_bikes_available": "Bikes Available",
+    "num_docks_available": "Docks Available",
+    "capacity": "Capacity",
+    "percent_full": "% Full",
+    "last_reported": "Last updated",
+    "lat": "Latitude",
+    "lon": "Longitude",
+}
+
+st.dataframe(
+    tbl.rename(columns=colmap),
+    use_container_width=True,
+    height=420,
+    hide_index=True,
+)
