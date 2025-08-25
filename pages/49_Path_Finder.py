@@ -82,13 +82,14 @@ if df is None or len(df) == 0:
     st.stop()
 
 try:
-    nodes, adj = build_station_graph(
-        df,
-        use_only_online=use_only_online,
-        k_neighbors=int(k_neighbors),
-        max_edge_km=float(max_edge_km),
-        avg_speed_kmh=float(avg_speed_kmh),
-    )
+    with st.spinner("Building station graph…"):
+        nodes, adj = build_station_graph(
+            df,
+            use_only_online=use_only_online,
+            k_neighbors=int(k_neighbors),
+            max_edge_km=float(max_edge_km),
+            avg_speed_kmh=float(avg_speed_kmh),
+        )
 except Exception as e:
     st.error(f"Could not build graph: {e}")
     st.stop()
@@ -221,15 +222,16 @@ with tab1:
 
     if run_plan and src and dst and src != dst:
         # Best route
-        steps, best_path = astar_steps(
-            adj=adj,
-            nodes=nodes,
-            source=src,
-            target=dst,
-            optimize_for=opt_for,
-            avg_speed_kmh=float(avg_speed_kmh),
-        )
-        st.session_state["pf_best_path"] = best_path
+        with st.spinner("Finding best route…"):
+            steps, best_path = astar_steps(
+                adj=adj,
+                nodes=nodes,
+                source=src,
+                target=dst,
+                optimize_for=opt_for,
+                avg_speed_kmh=float(avg_speed_kmh),
+            )
+            st.session_state["pf_best_path"] = best_path
 
         # Auto-center on best route
         if best_path:
