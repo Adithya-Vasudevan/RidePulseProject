@@ -1,0 +1,10 @@
+[theme]
+base = "dark"
+primaryColor = "#22D3EE"               # High-contrast accent on dark
+backgroundColor = "#0E1117"            # App background (near GitHub dark)
+secondaryBackgroundColor = "#161B22"   # Sidebar/containers
+textColor = "#E6E6E6"                  # Readable on dark
+font = "sans serif"
+
+[client]
+toolbarMode = "viewer"
