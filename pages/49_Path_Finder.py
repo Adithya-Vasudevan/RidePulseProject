@@ -1,576 +1,488 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import math
-import streamlit as st
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Optional, Tuple
+
+import numpy as np
 import pandas as pd
-import pydeck as pdk
+import plotly.graph_objects as go
+import requests
+import streamlit as st
 
-from utils.gbfs import merged_station_frame
-from utils.routing import (
-    build_station_graph,
-    path_metrics,
-    bfs_steps,
-    dijkstra_steps,
-    astar_steps,
-    greedy_best_first_steps,
-)
+UA = {"User-Agent": "RidePulse/1.0 (+https://github.com/Adithya-Vasudevan)"}
+REQUEST_TIMEOUT = 30
 
-st.set_page_config(page_title="Path Finder", page_icon="🧭", layout="wide")
-st.title("🧭 Path Finder (GBFS Stations)")
+GBFS_INFO = "https://gbfs.citibikenyc.com/gbfs/en/station_information.json"
+GBFS_STATUS = "https://gbfs.citibikenyc.com/gbfs/en/station_status.json"
 
-# -------------------------- Input Guide (clarity) --------------------------
-with st.expander("Input guide (what you need to choose)", expanded=True):
-    st.markdown(
-        """
-        - From station: The station where you start.
-        - To station: The station where you want to end.
-        - Graph options (left sidebar):
-          - Use only online stations: Use only stations currently renting and returning bikes.
-          - k-nearest neighbors per station: How many nearby station links to keep per station (higher = denser graph).
-          - Max edge length (km): Maximum distance allowed for a direct link between stations.
-          - Assumed cycling speed (km/h): Used to estimate time in minutes.
-        - Optimize for:
-          - time: fastest by estimated minutes.
-          - distance: shortest by kilometers.
-          - stops: fewest station-to-station hops.
-        - Note: It may take up to a couple of minutes while we prepare the best path for you.
-        """
-    )
-
-st.caption("Uses the live GBFS station data.")
-
-# Sidebar controls
-with st.sidebar:
-    st.subheader("Graph options")
-    use_only_online = st.toggle(
-        "Use only online stations",
-        value=False,
-        help="Include stations that are currently renting and returning.",
-    )
-    k_neighbors = st.slider(
-        "k-nearest neighbors per station",
-        min_value=3,
-        max_value=12,
-        value=6,
-        step=1,
-        help="Each station connects to this many nearest neighbors (within max edge length).",
-    )
-    max_edge_km = st.slider(
-        "Max edge length (km)",
-        min_value=0.3,
-        max_value=4.0,
-        value=2.0,
-        step=0.1,
-        help="Maximum allowed distance for a direct connection between stations.",
-    )
-    avg_speed_kmh = st.slider(
-        "Assumed cycling speed (km/h)",
-        min_value=8.0,
-        max_value=30.0,
-        value=15.0,
-        step=1.0,
-        help="Used to translate distance to time for the route metrics.",
-    )
-
-# Load stations and build graph
-with st.spinner("Loading live stations…"):
-    df = merged_station_frame()
-
-if df is None or len(df) == 0:
-    st.error("No station data available from GBFS.")
-    st.stop()
-
-try:
-    with st.spinner("Building station graph…"):
-        nodes, adj = build_station_graph(
-            df,
-            use_only_online=use_only_online,
-            k_neighbors=int(k_neighbors),
-            max_edge_km=float(max_edge_km),
-            avg_speed_kmh=float(avg_speed_kmh),
-        )
-except Exception as e:
-    st.error(f"Could not build graph: {e}")
-    st.stop()
-
-if not nodes or not adj:
-    st.warning("Graph is empty. Try increasing k-neighbors or the max edge length.")
-    st.stop()
-
-# Station selectors
-id_to_label = {n.id: f"{n.name} ({n.id})" if n.name != n.id else n.id for n in nodes.values()}
-sorted_ids = sorted(id_to_label.keys(), key=lambda i: id_to_label[i].lower())
-
-c1, c2 = st.columns([1, 1])
-with c1:
-    src = st.selectbox("From station (required)", options=sorted_ids, format_func=lambda i: id_to_label[i], key="src_global")
-with c2:
-    dst = st.selectbox("To station (required)", options=sorted_ids, index=min(1, len(sorted_ids)-1), format_func=lambda i: id_to_label[i], key="dst_global")
-
-if not src or not dst:
-    st.info("Please select both a start and a destination station to proceed.")
-
-if src and dst and src == dst:
-    st.error("Start and destination must be different.")
-
-# ------------------------------ Helpers ------------------------------
-def path_to_lonlat(path_ids):
-    return [[nodes[sid].lon, nodes[sid].lat] for sid in path_ids]
-
-def segment_midpoint(a_lon, a_lat, b_lon, b_lat):
-    return (a_lon + b_lon) / 2.0, (a_lat + b_lat) / 2.0
-
-def path_midpoint_lonlat(path_ids):
-    if not path_ids:
-        return None, None
-    idx = len(path_ids) // 2
-    sid = path_ids[idx]
-    return nodes[sid].lon, nodes[sid].lat
-
-def default_view_state():
-    df_nodes = pd.DataFrame([{"lat": n.lat, "lon": n.lon} for n in nodes.values()])
-    return pdk.ViewState(
-        latitude=float(df_nodes["lat"].mean()),
-        longitude=float(df_nodes["lon"].mean()),
-        zoom=12,
-        pitch=0,
-    )
-
-def _mercator_y(lat_deg: float) -> float:
-    lat_rad = math.radians(lat_deg)
-    return (1 - math.log(math.tan(lat_rad / 2 + math.pi / 4)) / math.pi) / 2
-
-def fit_view_state_for_points(points_lonlat, width_px=1100, height_px=650, padding=0.15):
-    # points_lonlat: list of [lon, lat]
-    if not points_lonlat:
-        return default_view_state()
-    lons = [p[0] for p in points_lonlat]
-    lats = [p[1] for p in points_lonlat]
-    min_lon, max_lon = min(lons), max(lons)
-    min_lat, max_lat = min(lats), max(lats)
-    center_lon = (min_lon + max_lon) / 2
-    center_lat = (min_lat + max_lat) / 2
-
-    lon_range = max(max_lon - min_lon, 1e-6)
-    x0_range = (lon_range / 360.0) * 256.0
-    y0_min = _mercator_y(max_lat) * 256.0
-    y0_max = _mercator_y(min_lat) * 256.0
-    y0_range = abs(y0_max - y0_min)
-    usable_w = max(width_px * (1 - 2 * padding), 1)
-    usable_h = max(height_px * (1 - 2 * padding), 1)
-    z_lon = math.log2(max(usable_w / x0_range, 1e-6))
-    z_lat = math.log2(max(usable_h / max(y0_range, 1e-9), 1e-6))
-    zoom = max(min(z_lon, z_lat, 20.0), 1.0)
-
-    return pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=float(zoom), pitch=0)
-
-# Session state for map and results
-if "pf_view_state" not in st.session_state:
-    st.session_state["pf_view_state"] = default_view_state()
-if "pf_best_path" not in st.session_state:
-    st.session_state["pf_best_path"] = []
-
-# ------------------------------- Tabs --------------------------------
-tab1, tab2 = st.tabs(["Route Planner", "Algorithms Explorer"])
-
-with tab1:
-    st.subheader("🗺️ Route Planner")
-    st.caption("Find the best route. The map will auto-center on the chosen path after you submit.")
-
-    colA, colB = st.columns([1, 1])
-    with colA:
-        opt_for = st.radio(
-            "Optimize for",
-            options=["time", "distance", "stops"],
-            index=0,
-            horizontal=True,
-            key="planner_opt_for",
-            help="Choose the objective for the best route.",
-        )
-    with colB:
-        st.empty()  # placeholder to keep layout balanced
-
-    # Label toggles
-    c6, c7, c8 = st.columns([1, 1, 1])
-    with c6:
-        show_segment_times = st.toggle(
-            "Show segment times on best route",
-            value=True,
-            help="Label each leg (station to station) with minutes.",
-            key="show_segment_times",
-        )
-    with c7:
-        show_stop_cumulative = st.toggle(
-            "Show cumulative time at each stop",
-            value=True,
-            help="Label each stop with total minutes from start.",
-            key="show_stop_cum",
-        )
-    with c8:
-        show_total_time_badge = st.toggle(
-            "Show total time badge",
-            value=True,
-            help="Display total minutes for the best route.",
-            key="show_total_badge",
-        )
-
-    run_plan = st.button("Find best route", type="primary", key="planner_run")
-
-    best_path = st.session_state.get("pf_best_path", [])
-    steps = []
-
-    if run_plan and src and dst and src != dst:
-        # Best route
-        with st.spinner("Finding best route…"):
-            steps, best_path = astar_steps(
-                adj=adj,
-                nodes=nodes,
-                source=src,
-                target=dst,
-                optimize_for=opt_for,
-                avg_speed_kmh=float(avg_speed_kmh),
-            )
-            st.session_state["pf_best_path"] = best_path
-
-        # Auto-center on best route
-        if best_path:
-            st.session_state["pf_view_state"] = fit_view_state_for_points(path_to_lonlat(best_path))
-
-        # Summary
-        st.subheader("Best route")
-        if not best_path:
-            st.error("No route found between the selected stations.")
-        else:
-            m = path_metrics(adj, best_path)
-            st.success(
-                f"Path: {' → '.join([nodes[i].name for i in best_path])} | "
-                f"Stops: {m['stops']} • Distance: {m['distance_km']} km • Time: {m['time_min']} min"
-            )
-
-    st.divider()
-    st.subheader("Map")
-
-    # Legend
-    st.markdown(
-        """
-        <div style="display:flex; gap:18px; align-items:center; flex-wrap:wrap;">
-          <div><span style="display:inline-block;width:14px;height:14px;background:#a0a0a0;opacity:0.5;margin-right:6px;border-radius:2px;"></span>Graph edges</div>
-          <div><span style="display:inline-block;width:14px;height:14px;background:#c61e1e;margin-right:6px;border-radius:2px;"></span>Best route</div>
-          <div><span style="display:inline-block;width:14px;height:14px;background:#228b22;margin-right:6px;border-radius:50%;"></span>Start</div>
-          <div><span style="display:inline-block;width:14px;height:14px;background:#b03060;margin-right:6px;border-radius:50%;"></span>Stop (intermediate)</div>
-          <div><span style="display:inline-block;width:14px;height:14px;background:#b22222;margin-right:6px;border-radius:50%;"></span>End</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
+# ---------- Theme ----------
+def _is_dark() -> bool:
     try:
-        # Node DF (for base points if needed)
-        nt = pd.DataFrame([{"id": n.id, "name": n.name, "lat": n.lat, "lon": n.lon} for n in nodes.values()])
+        return st.get_option("theme.base") == "dark"
+    except Exception:
+        return True
 
-        # Base graph edges
-        edges = []
-        for u, nbrs in adj.items():
-            for v in nbrs.keys():
-                if u < v:
-                    edges.append(
-                        {"from_lat": nodes[u].lat, "from_lon": nodes[u].lon, "to_lat": nodes[v].lat, "to_lon": nodes[v].lon}
-                    )
-        et = pd.DataFrame(edges)
-
-        # Best path data
-        best_path_ids = st.session_state.get("pf_best_path", [])
-        best_path_df = pd.DataFrame()
-        best_segments_text = pd.DataFrame()
-        best_nodes_df = pd.DataFrame()
-        total_badge_df = pd.DataFrame()
-
-        if best_path_ids:
-            # Path layer row
-            best_metrics = path_metrics(adj, best_path_ids)
-            best_path_df = pd.DataFrame(
-                [
-                    {
-                        "path": path_to_lonlat(best_path_ids),
-                        "label": "Best route",
-                        "stops": best_metrics["stops"],
-                        "distance_km": best_metrics["distance_km"],
-                        "time_min": best_metrics["time_min"],
-                    }
-                ]
-            )
-
-            # Segment times text at segment midpoints
-            if show_segment_times:
-                seg_rows = []
-                for a, b in zip(best_path_ids[:-1], best_path_ids[1:]):
-                    u = nodes[a]
-                    v = nodes[b]
-                    tmin = float(adj[a][b]["time_min"])
-                    mid_lon, mid_lat = segment_midpoint(u.lon, u.lat, v.lon, v.lat)
-                    seg_rows.append({"lon": mid_lon, "lat": mid_lat, "text": f"{tmin:.1f} min"})
-                if seg_rows:
-                    best_segments_text = pd.DataFrame(seg_rows)
-
-            # Stop circles with cumulative time
-            if show_stop_cumulative:
-                cum = 0.0
-                stop_rows = []
-                for idx, sid in enumerate(best_path_ids):
-                    if idx > 0:
-                        prev = best_path_ids[idx - 1]
-                        cum += float(adj[prev][sid]["time_min"])
-                    role = "start" if idx == 0 else ("end" if idx == len(best_path_ids) - 1 else "mid")
-                    color = [34, 139, 34, 230] if role == "start" else ([178, 34, 34, 230] if role == "end" else [176, 48, 96, 220])
-                    stop_rows.append(
-                        {
-                            "lon": nodes[sid].lon,
-                            "lat": nodes[sid].lat,
-                            "role": role,
-                            "color": color,
-                            "text": f"{nodes[sid].name}\n{cum:.1f} min",
-                        }
-                    )
-                if stop_rows:
-                    best_nodes_df = pd.DataFrame(stop_rows)
-
-            # Total time badge
-            if show_total_time_badge:
-                mid_lon, mid_lat = path_midpoint_lonlat(best_path_ids)
-                total_badge_df = pd.DataFrame(
-                    [{"lon": mid_lon, "lat": mid_lat, "text": f"Total: {best_metrics['time_min']} min"}]
-                )
-
-        # Build deck layers (order matters)
-        layers = []
-
-        # Base graph edges
-        layers.append(
-            pdk.Layer(
-                "LineLayer",
-                data=et,
-                get_source_position=["from_lon", "from_lat"],
-                get_target_position=["to_lon", "to_lat"],
-                get_color=[160, 160, 160, 60],
-                get_width=1,
-                pickable=False,
-            )
-        )
-
-        # Best route (red)
-        if not best_path_df.empty:
-            layers.append(
-                pdk.Layer(
-                    "PathLayer",
-                    data=best_path_df,
-                    get_path="path",
-                    get_color=[200, 30, 30, 230],
-                    get_width=7,
-                    width_min_pixels=6,
-                    width_max_pixels=12,
-                    pickable=True,
-                )
-            )
-            # Segment time labels
-            if not best_segments_text.empty:
-                layers.append(
-                    pdk.Layer(
-                        "TextLayer",
-                        data=best_segments_text,
-                        get_position=["lon", "lat"],
-                        get_text="text",
-                        get_color=[200, 30, 30, 230],
-                        get_size=13,
-                        get_text_anchor="middle",
-                        get_alignment_baseline="bottom",
-                    )
-                )
-            # Stop circles with cumulative labels
-            if not best_nodes_df.empty:
-                layers.append(
-                    pdk.Layer(
-                        "ScatterplotLayer",
-                        data=best_nodes_df,
-                        get_position=["lon", "lat"],
-                        get_fill_color="color",
-                        get_radius=55,
-                        radius_min_pixels=5,
-                        radius_max_pixels=12,
-                        pickable=True,
-                    )
-                )
-                layers.append(
-                    pdk.Layer(
-                        "TextLayer",
-                        data=best_nodes_df,
-                        get_position=["lon", "lat"],
-                        get_text="text",
-                        get_color=[40, 40, 40, 230],
-                        get_size=12,
-                        get_text_anchor="start",
-                        get_alignment_baseline="center",
-                    )
-                )
-            # Total time badge
-            if not total_badge_df.empty:
-                layers.append(
-                    pdk.Layer(
-                        "TextLayer",
-                        data=total_badge_df,
-                        get_position=["lon", "lat"],
-                        get_text="text",
-                        get_color=[0, 0, 0, 255],
-                        get_size=16,
-                        get_text_anchor="middle",
-                        get_alignment_baseline="top",
-                    )
-                )
-
-        tooltip = {"text": "Route: {label}\nTime: {time_min} min\nDistance: {distance_km} km\nStops: {stops}"}
-
-        st.pydeck_chart(
-            pdk.Deck(
-                map_style="mapbox://styles/mapbox/light-v9",
-                initial_view_state=st.session_state["pf_view_state"],
-                layers=layers,
-                tooltip=tooltip,
-            )
-        )
-    except Exception as e:
-        st.warning(f"Map rendering issue: {e}")
-
-with tab2:
-    st.subheader("🧭 Algorithms Explorer")
-    st.caption("Visualize BFS, Dijkstra, A*, and Greedy Best-First step-by-step with clear status and colors.")
-
-    algo = st.selectbox(
-        "Algorithm (choose one)",
-        options=["BFS (fewest stops)", "Dijkstra", "A*", "Greedy Best-First"],
-        index=2,
-        key="algo_select",
+def _apply_theme(fig: go.Figure) -> go.Figure:
+    dark = _is_dark()
+    font_color = "#C9D1D9" if dark else "#111827"
+    grid_color = "#30363d" if dark else "#e5e7eb"
+    fig.update_layout(
+        template="plotly_dark" if dark else "plotly_white",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color=font_color),
+        margin=dict(l=20, r=20, t=20, b=20),
     )
-    opt_for_alg = st.radio(
-        "Objective",
-        options=["time", "distance", "stops"],
-        index=0,
-        horizontal=True,
-        key="alg_opt_for",
-        help="Affects Dijkstra/A*/Greedy; BFS always optimizes for 'stops'.",
-    )
-    max_steps = st.slider(
-        "Max steps (safety cap)",
-        min_value=1000,
-        max_value=500000,
-        value=100000,
-        step=1000,
-        key="alg_max_steps",
-        help="Upper bound on the number of algorithm steps to record.",
-    )
+    return fig
 
-    run_search = st.button("Run search", type="primary", key="alg_run")
+# ---------- Helpers ----------
+def haversine_km(lat1: np.ndarray, lon1: np.ndarray, lat2: np.ndarray, lon2: np.ndarray) -> np.ndarray:
+    R = 6371.0
+    phi1 = np.radians(lat1)
+    phi2 = np.radians(lat2)
+    dphi = np.radians(lat2 - lat1)
+    dlambda = np.radians(lon2 - lon1)
+    a = np.sin(dphi/2.0)**2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda/2.0)**2
+    return 2 * R * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
 
-    steps = []
+def haversine_km_scalar(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = math.radians(lat2 - lat1), math.radians(lon2 - lon1)
+    a = math.sin(dp/2)**2 + math.cos(p1) * math.cos(p2) * math.sin(dl/2)**2
+    return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+def _load_gbfs() -> Tuple[pd.DataFrame, int]:
+    """
+    Return stations dataframe and last_updated (status feed).
+    Columns: station_id(str), name, lat, lon, capacity, is_renting, is_installed, bikes_available, docks_available
+    """
+    r1 = requests.get(GBFS_INFO, headers=UA, timeout=REQUEST_TIMEOUT)
+    r1.raise_for_status()
+    info = r1.json()
+
+    r2 = requests.get(GBFS_STATUS, headers=UA, timeout=REQUEST_TIMEOUT)
+    r2.raise_for_status()
+    status = r2.json()
+
+    info_df = pd.DataFrame(info["data"]["stations"])
+    status_df = pd.DataFrame(status["data"]["stations"])
+    last_updated = int(status.get("last_updated", 0))
+
+    status_df = status_df.rename(columns={
+        "num_bikes_available": "bikes_available",
+        "num_docks_available": "docks_available",
+        "is_renting": "is_renting",
+        "is_installed": "is_installed",
+    })
+
+    df = info_df.merge(status_df[["station_id", "is_renting", "is_installed", "bikes_available", "docks_available"]],
+                       on="station_id", how="left")
+    df["is_renting"] = df["is_renting"].fillna(0).astype(int)
+    df["is_installed"] = df["is_installed"].fillna(0).astype(int)
+    df["bikes_available"] = df["bikes_available"].fillna(0).astype(int)
+    df["docks_available"] = df["docks_available"].fillna(0).astype(int)
+    df["station_id"] = df["station_id"].astype(str)
+    return df, last_updated
+
+@dataclass(frozen=True)
+class GraphConfig:
+    use_only_online: bool
+    k_neighbors: int
+    max_edge_km: float
+    avg_speed_kmh: float
+
+@dataclass
+class GraphData:
+    stations: pd.DataFrame
+    edges: List[Tuple[str, str, float]]  # (u, v, base_km)
+    adjacency: Dict[str, List[Tuple[str, float]]]
+
+@st.cache_resource(show_spinner=True)
+def build_station_graph(stations_in: pd.DataFrame, data_sig: Tuple, cfg: GraphConfig) -> GraphData:
+    """
+    Vectorized k-NN graph builder with distance-based edges.
+    Cache keyed by a lightweight data_sig and GraphConfig.
+    """
+    # Filter stations
+    if cfg.use_only_online:
+        s = stations_in[(stations_in["is_installed"] == 1) & (stations_in["is_renting"] == 1)
+                        & (stations_in["bikes_available"] > 0)].copy()
+    else:
+        s = stations_in.copy()
+
+    s = s.dropna(subset=["lat", "lon", "station_id"])
+    s["station_id"] = s["station_id"].astype(str)
+    s = s.reset_index(drop=True)
+
+    lat = s["lat"].to_numpy()
+    lon = s["lon"].to_numpy()
+    ids = s["station_id"].to_numpy()
+
+    n = len(s)
+    edges: List[Tuple[str, str, float]] = []
+    for i in range(n):
+        di = haversine_km(lat[i], lon[i], lat, lon)  # km to all j
+        order = np.argsort(di)
+        added = 0
+        for j in order:
+            if i == j:
+                continue
+            d = float(di[j])
+            if d <= 0:
+                continue
+            if d > cfg.max_edge_km:
+                # Skip overly long straight-line edges
+                continue
+            edges.append((ids[i], ids[j], d))
+            added += 1
+            if added >= cfg.k_neighbors:
+                break
+
+    adj: Dict[str, List[Tuple[str, float]]] = {}
+    for u, v, d in edges:
+        adj.setdefault(u, []).append((v, d))
+        adj.setdefault(v, []).append((u, d))
+    return GraphData(stations=s, edges=edges, adjacency=adj)
+
+# ---------- Search (A* + Dijkstra with custom weights) ----------
+def make_weight_func(
+    mode: str,
+    alpha_avail: float,
+    hop_penalty_min: float,
+    avg_speed_kmh: float,
+    station_index: pd.DataFrame,
+) -> Callable[[str, str, float], float]:
+    """
+    Return a function w(u, v, base_km) -> effective_cost
+    Modes: dist | avail | mix | hops
+    """
+    hop_penalty_km = (hop_penalty_min * avg_speed_kmh) / 60.0 if hop_penalty_min > 0 else 0.0
+
+    def w(u: str, v: str, base_km: float) -> float:
+        if mode == "hops":
+            # Prefer fewer edges; tiny distance tiebreak to avoid degenerate equal-cost paths
+            return 1.0 + 1e-6 * base_km
+
+        avail_mult = 1.0
+        if mode in ("avail", "mix"):
+            # Availability penalty (encourage edges from stocked → to dock-rich)
+            su = station_index.loc[u]
+            sv = station_index.loc[v]
+            p_bikes = 0.0 if su["bikes_available"] > 2 else (2 - su["bikes_available"]) * 0.1
+            p_docks = 0.0 if sv["docks_available"] > 2 else (2 - sv["docks_available"]) * 0.1
+            avail_mult = 1.0 + alpha_avail * (p_bikes + p_docks)
+
+        extra = hop_penalty_km if mode == "mix" else 0.0
+        return base_km * avail_mult + extra
+
+    return w
+
+def make_heuristic(mode: str, coords: Dict[str, Tuple[float, float]], dst: str) -> Callable[[str], float]:
+    """
+    Admissible heuristic for A*. For non-negative edge penalties we can still use straight-line km.
+    For hops mode, use zero heuristic.
+    """
+    if mode == "hops":
+        return lambda u: 0.0
+
+    lat2, lon2 = coords[dst]
+    def h(u: str) -> float:
+        lat1, lon1 = coords[u]
+        return haversine_km_scalar(lat1, lon1, lat2, lon2)
+    return h
+
+def astar_generic(
+    adjacency: Dict[str, List[Tuple[str, float]]],
+    src: str,
+    dst: str,
+    weight: Callable[[str, str, float], float],
+    heuristic: Callable[[str], float],
+) -> Tuple[List[str], float]:
+    import heapq
+    g = {src: 0.0}
+    prev: Dict[str, Optional[str]] = {src: None}
+    openq = [(heuristic(src), 0.0, src)]  # (f, g, node)
+    visited = set()
+
+    while openq:
+        f, curg, u = heapq.heappop(openq)
+        if u in visited:
+            continue
+        visited.add(u)
+        if u == dst:
+            break
+        for v, base_w in adjacency.get(u, []):
+            w = weight(u, v, base_w)
+            ng = curg + w
+            if ng < g.get(v, float("inf")):
+                g[v] = ng
+                prev[v] = u
+                heapq.heappush(openq, (ng + heuristic(v), ng, v))
+
+    if dst not in g:
+        return [], float("inf")
+
     path = []
-    if run_search and src and dst and src != dst:
-        with st.spinner("Running search…"):
-            if algo.startswith("BFS"):
-                steps, path = bfs_steps(adj, src, dst, max_steps=int(max_steps))
-            elif algo.startswith("Dijkstra"):
-                weight_key = {"time": "time_min", "distance": "distance_km", "stops": None}[opt_for_alg]
-                if opt_for_alg == "stops":
-                    adj_unit = {u: {v: {"weight": 1.0} for v in nbrs} for u, nbrs in adj.items()}
-                    steps, path = dijkstra_steps(adj_unit, src, dst, weight_key="weight", max_steps=int(max_steps))
-                else:
-                    steps, path = dijkstra_steps(adj, src, dst, weight_key=weight_key or "weight", max_steps=int(max_steps))
-            elif algo.startswith("A*"):
-                steps, path = astar_steps(
-                    adj=adj,
-                    nodes=nodes,
-                    source=src,
-                    target=dst,
-                    optimize_for=opt_for_alg,
-                    avg_speed_kmh=float(avg_speed_kmh),
-                    max_steps=int(max_steps),
-                )
-            else:
-                steps, path = greedy_best_first_steps(
-                    adj=adj,
-                    nodes=nodes,
-                    source=src,
-                    target=dst,
-                    optimize_for=opt_for_alg,
-                    avg_speed_kmh=float(avg_speed_kmh),
-                    max_steps=int(max_steps),
-                )
+    cur = dst
+    while cur is not None:
+        path.append(cur)
+        cur = prev.get(cur)
+    path.reverse()
+    return path, g[dst]
 
-    if steps:
-        st.success(f"Steps: {len(steps)} | Path found: {'Yes' if path else 'No'}")
-        step_idx = st.slider("Step", 0, max(0, len(steps) - 1), value=0, key="alg_step_idx")
-        frame = steps[step_idx]
+def dijkstra_generic(
+    adjacency: Dict[str, List[Tuple[str, float]]],
+    src: str,
+    dst: str,
+    weight: Callable[[str, str, float], float],
+) -> Tuple[List[str], float]:
+    import heapq
+    dist = {src: 0.0}
+    prev: Dict[str, Optional[str]] = {src: None}
+    pq = [(0.0, src)]
+    visited = set()
 
-        # Map visualization for the current step (auto-center on final path if found)
-        nt = pd.DataFrame([{"id": n.id, "name": n.name, "lat": n.lat, "lon": n.lon} for n in nodes.values()])
+    while pq:
+        d, u = heapq.heappop(pq)
+        if u in visited:
+            continue
+        visited.add(u)
+        if u == dst:
+            break
+        for v, base_w in adjacency.get(u, []):
+            w = weight(u, v, base_w)
+            nd = d + w
+            if nd < dist.get(v, float("inf")):
+                dist[v] = nd
+                prev[v] = u
+                heapq.heappush(pq, (nd, v))
 
-        relax_edges = [{"from_lat": nodes[u].lat, "from_lon": nodes[u].lon, "to_lat": nodes[v].lat, "to_lon": nodes[v].lon} for u, v in frame.relaxations]
-        relax_df = pd.DataFrame(relax_edges)
+    if dst not in dist:
+        return [], float("inf")
 
-        pe = [{"from_lat": nodes[a].lat, "from_lon": nodes[a].lon, "to_lat": nodes[b].lat, "to_lon": nodes[b].lon} for a, b in zip(path[:-1], path[1:])] if path else []
-        pe_df = pd.DataFrame(pe)
+    path = []
+    cur = dst
+    while cur is not None:
+        path.append(cur)
+        cur = prev.get(cur)
+    path.reverse()
+    return path, dist[dst]
 
-        visited_ids = list(frame.visited)
-        frontier_ids = [n for _, n in frame.frontier]
-        current_id = frame.current
+# ---------- Page ----------
+st.set_page_config(page_title="Path Finder • RidePulse", page_icon="🧭", layout="wide")
+st.title("🧭 Path Finder (NYC Citi Bike)")
 
-        def color_for(node_id: str):
-            if node_id == src:
-                return [34, 139, 34, 220]  # green
-            if node_id == dst:
-                return [200, 30, 30, 220]  # red
-            if node_id == current_id:
-                return [155, 89, 182, 230]  # purple
-            if node_id in frontier_ids:
-                return [241, 196, 15, 220]  # yellow
-            if node_id in visited_ids:
-                return [52, 152, 219, 200]  # blue
-            return [150, 150, 150, 120]  # grey
+# Read deep-linking params
+qp = st.query_params
+qp_src = qp.get("src")
+qp_dst = qp.get("dst")
+qp_opt = qp.get("opt", "dist")
+def _to_float(s, default):
+    try:
+        return float(s)
+    except Exception:
+        return default
+qp_alpha = _to_float(qp.get("alpha", 0.3), 0.3)
+qp_hop = _to_float(qp.get("hop", 0.5), 0.5)
+qp_astar = str(qp.get("astar", "1")).lower() in ("1", "true", "yes")
 
-        nt["color"] = nt["id"].apply(color_for)
+# Sidebar options
+with st.sidebar:
+    st.header("Options")
+    c1, c2 = st.columns(2)
+    with c1:
+        use_only_online = st.toggle("Only active", value=True, help="Only include installed, renting stations with bike availability.")
+    with c2:
+        show_edges = st.toggle("Show edges", value=False, help="Render base graph edges (can be heavy).")
 
-        view_state_alg = default_view_state()
-        if path:
-            view_state_alg = fit_view_state_for_points([[nodes[i].lon, nodes[i].lat] for i in path])
+    k_neighbors = st.slider("Neighbors per node (k)", min_value=3, max_value=12, value=6, step=1)
+    max_edge_km = st.slider("Max edge length (km)", min_value=0.3, max_value=3.0, value=2.0, step=0.1)
+    avg_speed_kmh = st.slider("Avg speed (km/h)", min_value=8.0, max_value=25.0, value=15.0, step=0.5)
 
-        layers = [
-            pdk.Layer(
-                "LineLayer",
-                data=relax_df,
-                get_source_position=["from_lon", "from_lat"],
-                get_target_position=["to_lon", "to_lat"],
-                get_color=[255, 140, 0, 200],
-                get_width=4,
-                pickable=False,
-            ),
-            pdk.Layer(
-                "LineLayer",
-                data=pe_df,
-                get_source_position=["from_lon", "from_lat"],
-                get_target_position=["to_lon", "to_lat"],
-                get_color=[200, 30, 30, 230],
-                get_width=6,
-                pickable=False,
-            ),
-            pdk.Layer(
-                "ScatterplotLayer",
-                data=nt,
-                get_position=["lon", "lat"],
-                get_fill_color="color",
-                get_radius=50,
-                pickable=True,
-                radius_min_pixels=4,
-                radius_max_pixels=10,
-            ),
-        ]
-        st.pydeck_chart(pdk.Deck(map_style="mapbox://styles/mapbox/light-v9", initial_view_state=view_state_alg, layers=layers))
-    elif run_search and (not src or not dst or src == dst):
-        st.info("Pick two different stations first.")
+    # Optimization modes
+    opt_labels = ["Shortest distance", "Availability priority", "Balanced (distance + availability)", "Fewest hops"]
+    opt_keys = ["dist", "avail", "mix", "hops"]
+    try:
+        opt_index_default = opt_keys.index(qp_opt)  # resume from deep link if valid
+    except Exception:
+        opt_index_default = 0
+    optimize_for = st.radio("Optimize for", opt_labels, index=opt_index_default, horizontal=False)
+
+    # Resolve mode key
+    mode = opt_keys[opt_labels.index(optimize_for)]
+
+    # A* toggle
+    use_astar = st.toggle("Use A* (faster)", value=qp_astar, help="Speed up search while preserving optimality.")
+
+    # Extra controls depending on mode
+    alpha_avail = qp_alpha
+    hop_penalty_min = qp_hop
+    if mode in ("avail", "mix"):
+        alpha_avail = st.slider("Availability priority (α)", min_value=0.0, max_value=1.0, value=float(qp_alpha), step=0.05,
+                                help="How strongly to prefer routes starting with more bikes and ending with more docks.")
+    if mode in ("mix", "hops"):
+        hop_penalty_min = st.slider("Per-hop penalty (min)", min_value=0.0, max_value=5.0, value=float(qp_hop), step=0.1,
+                                    help="Adds a fixed time per station-to-station hop to encourage fewer hops.")
+
+# Load GBFS
+try:
+    with st.spinner("Fetching stations…"):
+        stations_raw, last_updated = _load_gbfs()
+except Exception as e:
+    st.error(f"Could not load Citi Bike GBFS feeds: {e}")
+    st.stop()
+
+# Build graph (cached)
+cfg = GraphConfig(
+    use_only_online=use_only_online,
+    k_neighbors=int(k_neighbors),
+    max_edge_km=float(max_edge_km),
+    avg_speed_kmh=float(avg_speed_kmh),
+)
+data_sig = (last_updated, len(stations_raw))
+graph = build_station_graph(stations_raw, data_sig, cfg)
+
+# Station selectors (respect deep-link IDs if valid)
+station_ids = graph.stations["station_id"].astype(str).tolist()
+station_map_name_to_id = dict(zip(graph.stations["name"], graph.stations["station_id"].astype(str)))
+station_map_id_to_name = dict(zip(graph.stations["station_id"].astype(str), graph.stations["name"]))
+
+def _default_station_id(idx: int) -> str:
+    if 0 <= idx < len(station_ids):
+        return station_ids[idx]
+    return station_ids[0] if station_ids else ""
+
+src_id_default = qp_src if (isinstance(qp_src, str) and qp_src in station_ids) else _default_station_id(0)
+dst_id_default = qp_dst if (isinstance(qp_dst, str) and qp_dst in station_ids) else _default_station_id(min(1, len(station_ids)-1))
+
+colA, colB, colC = st.columns([3, 3, 1])
+with colA:
+    src_name = station_map_id_to_name.get(src_id_default, graph.stations.iloc[0]["name"])
+    src_sel = st.selectbox(
+        "Start station",
+        options=graph.stations["name"],
+        index=int(graph.stations.index[graph.stations["name"] == src_name][0]) if src_name in graph.stations["name"].values else 0,
+    )
+with colB:
+    dst_name = station_map_id_to_name.get(dst_id_default, graph.stations.iloc[min(1, len(graph.stations)-1)]["name"])
+    dst_sel = st.selectbox(
+        "End station",
+        options=graph.stations["name"],
+        index=int(graph.stations.index[graph.stations["name"] == dst_name][0]) if dst_name in graph.stations["name"].values else min(1, len(graph.stations)-1),
+    )
+with colC:
+    if st.button("Swap"):
+        src_sel, dst_sel = dst_sel, src_sel
+
+src_id = station_map_name_to_id[src_sel]
+dst_id = station_map_name_to_id[dst_sel]
+
+# Prepare weighting and heuristic
+station_index = graph.stations.set_index("station_id")
+coords = {row.station_id: (float(row.lat), float(row.lon)) for _, row in graph.stations.iterrows()}
+weight = make_weight_func(mode, float(alpha_avail), float(hop_penalty_min), float(cfg.avg_speed_kmh), station_index)
+heuristic = make_heuristic(mode, coords, dst_id)
+
+# Route search
+route_btn = st.button("Find best route", type="primary", use_container_width=True)
+path_ids: List[str] = []
+total_cost = float("inf")
+if route_btn:
+    with st.spinner("Computing route…"):
+        if use_astar:
+            path_ids, total_cost = astar_generic(graph.adjacency, src_id, dst_id, weight, heuristic)
+        else:
+            path_ids, total_cost = dijkstra_generic(graph.adjacency, src_id, dst_id, weight)
+    # Update deep link params
+    st.query_params.update({
+        "src": src_id,
+        "dst": dst_id,
+        "opt": mode,
+        "alpha": f"{alpha_avail:.2f}",
+        "hop": f"{hop_penalty_min:.2f}",
+        "astar": "1" if use_astar else "0",
+    })
+
+# Map rendering (Plotly ScatterMapbox using open-street-map style; no token needed)
+center_lat = float(graph.stations["lat"].mean())
+center_lon = float(graph.stations["lon"].mean())
+
+fig = go.Figure()
+
+# Base edges (optional)
+if show_edges and len(graph.edges) > 0:
+    edges_to_plot = graph.edges
+    if len(edges_to_plot) > 8000:
+        edges_to_plot = edges_to_plot[::max(1, len(edges_to_plot)//8000)]
+    xs: List[float] = []
+    ys: List[float] = []
+    idx_by_id = graph.stations.set_index("station_id")[["lon", "lat"]]
+    for u, v, _ in edges_to_plot:
+        su = idx_by_id.loc[u]
+        sv = idx_by_id.loc[v]
+        xs += [float(su["lon"]), float(sv["lon"]), None]
+        ys += [float(su["lat"]), float(sv["lat"]), None]
+    fig.add_trace(go.Scattermapbox(
+        lon=xs, lat=ys, mode="lines",
+        line=dict(width=1, color="#94a3b8"),
+        name="Edges", showlegend=False, hoverinfo="skip"
+    ))
+
+# Stations
+fig.add_trace(go.Scattermapbox(
+    lon=graph.stations["lon"], lat=graph.stations["lat"],
+    mode="markers",
+    marker=dict(size=6, color="#3b82f6"),
+    text=graph.stations["name"],
+    hoverinfo="text",
+    name="Stations",
+))
+
+# Path overlay
+if path_ids:
+    pts = graph.stations.set_index("station_id").loc[path_ids][["lon", "lat"]]
+    fig.add_trace(go.Scattermapbox(
+        lon=pts["lon"], lat=pts["lat"],
+        mode="lines+markers",
+        line=dict(width=4, color="#10b981"),
+        marker=dict(size=8, color="#10b981"),
+        name="Best path",
+    ))
+
+fig.update_layout(
+    mapbox=dict(
+        style="open-street-map",
+        center=dict(lat=center_lat, lon=center_lon),
+        zoom=11,
+    ),
+    height=560,
+    legend=dict(orientation="h", yanchor="bottom", y=0.01, x=0.01),
+)
+st.plotly_chart(_apply_theme(fig), use_container_width=True, theme="streamlit")
+
+# Metrics
+m1, m2, m3 = st.columns(3)
+with m1:
+    st.metric("Stations in graph", f"{len(graph.stations):,}")
+with m2:
+    st.metric("Edges", f"{len(graph.edges):,}")
+with m3:
+    if path_ids:
+        # For distance-like modes, estimate ETA from straight-line km sum proxy
+        # For hops mode, we can’t derive km from cost; show hop count instead.
+        if mode == "hops":
+            st.metric("Path (hops)", f"{len(path_ids)-1} hops")
+        else:
+            # Approximate total km by summing base distances along path
+            base_km_sum = 0.0
+            adj_map = {u: {v: d for v, d in nbrs} for u, nbrs in graph.adjacency.items()}
+            for u, v in zip(path_ids[:-1], path_ids[1:]):
+                base_km_sum += adj_map[u][v]
+            eta_min = base_km_sum / max(1e-3, cfg.avg_speed_kmh) * 60.0
+            st.metric("Path length / ETA", f"{base_km_sum:.2f} km • {eta_min:.0f} min")
+    else:
+        st.metric("Path", "—")
+
+st.caption("Tip: After computing a route, the URL updates with src/dst/opt so you can share the exact selection and options.")
