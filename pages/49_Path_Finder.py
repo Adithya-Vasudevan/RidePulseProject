@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import hashlib
 import streamlit as st
 import pandas as pd
 import pydeck as pdk
@@ -18,6 +19,68 @@ from utils.routing import (
 
 st.set_page_config(page_title="Path Finder", page_icon="🧭", layout="wide")
 st.title("🧭 Path Finder (GBFS Stations)")
+
+# Check for deep-linking via URL query params
+query_params = st.query_params
+src_from_url = query_params.get('src')
+dst_from_url = query_params.get('dst')  
+opt_from_url = query_params.get('opt', 'time')
+
+# -------- Cached station graph builder --------
+@st.cache_resource(ttl=120, show_spinner=False)
+def cached_build_station_graph(
+    data_hash: str,
+    use_only_online: bool,
+    k_neighbors: int,
+    max_edge_km: float,
+    avg_speed_kmh: float,
+):
+    """Cached wrapper for build_station_graph with data signature."""
+    df = merged_station_frame()
+    if df is None or len(df) == 0:
+        raise ValueError("No station data available from GBFS.")
+    return build_station_graph(
+        df,
+        use_only_online=use_only_online,
+        k_neighbors=int(k_neighbors),
+        max_edge_km=float(max_edge_km),
+        avg_speed_kmh=float(avg_speed_kmh),
+    )
+
+def get_data_signature(df):
+    """Create lightweight signature of station data for cache key."""
+    if df is None or len(df) == 0:
+        return "empty"
+    
+    # Use station count and sample of station IDs/coordinates as signature
+    # Handle different possible column names
+    id_col = None
+    lat_col = None  
+    lon_col = None
+    
+    for col in ['station_id', 'id', 'stationCode']:
+        if col in df.columns:
+            id_col = col
+            break
+    
+    for col in ['lat', 'latitude']:
+        if col in df.columns:
+            lat_col = col
+            break
+            
+    for col in ['lon', 'lng', 'longitude']:
+        if col in df.columns:
+            lon_col = col
+            break
+    
+    if id_col and lat_col and lon_col:
+        sample_cols = [id_col, lat_col, lon_col]
+        station_sample = df.head(10)[sample_cols].values.tobytes() if len(df) >= 10 else df[sample_cols].values.tobytes()
+        signature_data = f"{len(df)}_{hashlib.md5(station_sample).hexdigest()[:8]}"
+        return signature_data
+    else:
+        # Fallback: just use row count and column names
+        return f"{len(df)}_{hashlib.md5(str(df.columns.tolist()).encode()).hexdigest()[:8]}"
 
 # -------------------------- Input Guide (clarity) --------------------------
 with st.expander("Input guide (what you need to choose)", expanded=True):
@@ -72,6 +135,13 @@ with st.sidebar:
         step=1.0,
         help="Used to translate distance to time for the route metrics.",
     )
+    
+    st.divider()
+    show_base_edges = st.toggle(
+        "Show base graph edges",
+        value=True,
+        help="Display underlying connections between stations (gray lines). Turn off for cleaner view on dense graphs.",
+    )
 
 # Load stations and build graph
 with st.spinner("Loading live stations…"):
@@ -82,13 +152,15 @@ if df is None or len(df) == 0:
     st.stop()
 
 try:
+    # Use cached graph builder with data signature
+    data_sig = get_data_signature(df)
     with st.spinner("Building station graph…"):
-        nodes, adj = build_station_graph(
-            df,
+        nodes, adj = cached_build_station_graph(
+            data_hash=data_sig,
             use_only_online=use_only_online,
-            k_neighbors=int(k_neighbors),
-            max_edge_km=float(max_edge_km),
-            avg_speed_kmh=float(avg_speed_kmh),
+            k_neighbors=k_neighbors,
+            max_edge_km=max_edge_km,
+            avg_speed_kmh=avg_speed_kmh,
         )
 except Exception as e:
     st.error(f"Could not build graph: {e}")
@@ -102,17 +174,54 @@ if not nodes or not adj:
 id_to_label = {n.id: f"{n.name} ({n.id})" if n.name != n.id else n.id for n in nodes.values()}
 sorted_ids = sorted(id_to_label.keys(), key=lambda i: id_to_label[i].lower())
 
+# Determine default selections, prioritizing URL params
+default_src_idx = 0
+default_dst_idx = min(1, len(sorted_ids)-1)
+
+if src_from_url and src_from_url in id_to_label:
+    try:
+        default_src_idx = sorted_ids.index(src_from_url)
+    except ValueError:
+        pass
+
+if dst_from_url and dst_from_url in id_to_label:
+    try:
+        default_dst_idx = sorted_ids.index(dst_from_url)
+    except ValueError:
+        pass
+
 c1, c2 = st.columns([1, 1])
 with c1:
-    src = st.selectbox("From station (required)", options=sorted_ids, format_func=lambda i: id_to_label[i], key="src_global")
+    src = st.selectbox(
+        "From station (required)", 
+        options=sorted_ids, 
+        index=default_src_idx,
+        format_func=lambda i: id_to_label[i], 
+        key="src_global"
+    )
 with c2:
-    dst = st.selectbox("To station (required)", options=sorted_ids, index=min(1, len(sorted_ids)-1), format_func=lambda i: id_to_label[i], key="dst_global")
+    dst = st.selectbox(
+        "To station (required)", 
+        options=sorted_ids, 
+        index=default_dst_idx,
+        format_func=lambda i: id_to_label[i], 
+        key="dst_global"
+    )
 
 if not src or not dst:
     st.info("Please select both a start and a destination station to proceed.")
 
 if src and dst and src == dst:
     st.error("Start and destination must be different.")
+
+# Update URL params for sharing when selections change
+if src and dst:
+    new_params = {'src': src, 'dst': dst}
+    # Only update if params actually changed to avoid infinite rerun
+    current_src = st.query_params.get('src')
+    current_dst = st.query_params.get('dst')
+    if current_src != src or current_dst != dst:
+        st.query_params.update(new_params)
 
 # ------------------------------ Helpers ------------------------------
 def path_to_lonlat(path_ids):
@@ -180,14 +289,24 @@ with tab1:
 
     colA, colB = st.columns([1, 1])
     with colA:
+        # Use URL param for initial optimization selection
+        opt_options = ["time", "distance", "stops"]
+        default_opt_idx = 0
+        if opt_from_url in opt_options:
+            default_opt_idx = opt_options.index(opt_from_url)
+            
         opt_for = st.radio(
             "Optimize for",
-            options=["time", "distance", "stops"],
-            index=0,
+            options=opt_options,
+            index=default_opt_idx,
             horizontal=True,
             key="planner_opt_for",
             help="Choose the objective for the best route.",
         )
+        
+        # Update URL param for optimization option
+        if opt_for != st.query_params.get('opt'):
+            st.query_params.update({'opt': opt_for})
     with colB:
         st.empty()  # placeholder to keep layout balanced
 
@@ -252,16 +371,18 @@ with tab1:
     st.subheader("Map")
 
     # Legend
+    legend_parts = []
+    if show_base_edges:
+        legend_parts.append('<div><span style="display:inline-block;width:14px;height:14px;background:#a0a0a0;opacity:0.5;margin-right:6px;border-radius:2px;"></span>Graph edges</div>')
+    legend_parts.extend([
+        '<div><span style="display:inline-block;width:14px;height:14px;background:#c61e1e;margin-right:6px;border-radius:2px;"></span>Best route</div>',
+        '<div><span style="display:inline-block;width:14px;height:14px;background:#228b22;margin-right:6px;border-radius:50%;"></span>Start</div>',
+        '<div><span style="display:inline-block;width:14px;height:14px;background:#b03060;margin-right:6px;border-radius:50%;"></span>Stop (intermediate)</div>',
+        '<div><span style="display:inline-block;width:14px;height:14px;background:#b22222;margin-right:6px;border-radius:50%;"></span>End</div>'
+    ])
+    
     st.markdown(
-        """
-        <div style="display:flex; gap:18px; align-items:center; flex-wrap:wrap;">
-          <div><span style="display:inline-block;width:14px;height:14px;background:#a0a0a0;opacity:0.5;margin-right:6px;border-radius:2px;"></span>Graph edges</div>
-          <div><span style="display:inline-block;width:14px;height:14px;background:#c61e1e;margin-right:6px;border-radius:2px;"></span>Best route</div>
-          <div><span style="display:inline-block;width:14px;height:14px;background:#228b22;margin-right:6px;border-radius:50%;"></span>Start</div>
-          <div><span style="display:inline-block;width:14px;height:14px;background:#b03060;margin-right:6px;border-radius:50%;"></span>Stop (intermediate)</div>
-          <div><span style="display:inline-block;width:14px;height:14px;background:#b22222;margin-right:6px;border-radius:50%;"></span>End</div>
-        </div>
-        """,
+        f'<div style="display:flex; gap:18px; align-items:center; flex-wrap:wrap;">{"".join(legend_parts)}</div>',
         unsafe_allow_html=True,
     )
 
@@ -345,18 +466,19 @@ with tab1:
         # Build deck layers (order matters)
         layers = []
 
-        # Base graph edges
-        layers.append(
-            pdk.Layer(
-                "LineLayer",
-                data=et,
-                get_source_position=["from_lon", "from_lat"],
-                get_target_position=["to_lon", "to_lat"],
-                get_color=[160, 160, 160, 60],
-                get_width=1,
-                pickable=False,
+        # Base graph edges (conditional)
+        if show_base_edges and not et.empty:
+            layers.append(
+                pdk.Layer(
+                    "LineLayer",
+                    data=et,
+                    get_source_position=["from_lon", "from_lat"],
+                    get_target_position=["to_lon", "to_lat"],
+                    get_color=[160, 160, 160, 60],
+                    get_width=1,
+                    pickable=False,
+                )
             )
-        )
 
         # Best route (red)
         if not best_path_df.empty:
