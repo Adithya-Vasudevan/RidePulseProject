@@ -25,6 +25,11 @@ CITIBIKE_S3_BASE = "https://s3.amazonaws.com/tripdata/"
 CITIBIKE_S3_INDEX = CITIBIKE_S3_BASE + "?list-type=2"
 CITIBIKE_SYSTEM_DATA = "https://ride.citibikenyc.com/system-data"
 
+# Open-Meteo for NYC (no API key); America/New_York local timestamps
+OPEN_METEO_ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
+NYC_LAT, NYC_LON = 40.7128, -74.0060
+NYC_TZ = "America/New_York"
+
 # -----------------------------------------------
 # Theme helpers
 # -----------------------------------------------
@@ -53,13 +58,6 @@ def _apply_theme(fig: go.Figure) -> go.Figure:
 # Citi Bike discovery + loading
 # -----------------------------------------------
 def _extract_ym_from_key(key: str) -> Optional[Tuple[int, int]]:
-    """
-    Extract (year, month) from a Citi Bike filename/key.
-    Examples:
-      2025-07-citibike-tripdata.csv.zip
-      202507-citibike-tripdata.csv.zip
-      JC-2025-07-citibike-tripdata.csv.zip
-    """
     m = re.search(r"(20\d{2})[-_]?(\d{2})", key)
     if not m:
         m2 = re.search(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec).*(20\d{2})", key, flags=re.I)
@@ -70,31 +68,23 @@ def _extract_ym_from_key(key: str) -> Optional[Tuple[int, int]]:
     return int(m.group(1)), int(m.group(2))
 
 def _parse_s3_list(xml_text: str) -> Tuple[List[str], Optional[str]]:
-    """
-    Parse S3 ListV2 XML and return (keys, next_continuation_token).
-    """
     keys: List[str] = []
     ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
     try:
         root = ET.fromstring(xml_text)
     except ET.ParseError:
         return [], None
-
     for contents in root.findall(".//s3:Contents", ns):
         key_elem = contents.find("s3:Key", ns)
         if key_elem is not None and key_elem.text:
             k = key_elem.text
             if re.search(r"\.(csv|csv\.zip|parquet)$", k, flags=re.I):
                 keys.append(k)
-
     next_token_elem = root.find(".//s3:NextContinuationToken", ns)
     next_token = next_token_elem.text if next_token_elem is not None else None
     return keys, next_token
 
 def _discover_from_s3(max_pages: int = 15) -> List[str]:
-    """
-    List keys via S3 ListV2 with pagination.
-    """
     all_keys: List[str] = []
     token: Optional[str] = None
     pages = 0
@@ -110,20 +100,15 @@ def _discover_from_s3(max_pages: int = 15) -> List[str]:
     return all_keys
 
 def _discover_from_system_data_page() -> List[str]:
-    """
-    Scrape the official system-data page for monthly trip links.
-    """
     r = requests.get(CITIBIKE_SYSTEM_DATA, headers=UA, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     html = r.text
     keys: List[str] = []
-    # Links like .../tripdata/2025-07-citibike-tripdata.csv.zip
     for m in re.finditer(r'href="[^"]*?/tripdata/([^"]+?\.(?:csv(?:\.zip)?|parquet))"', html, flags=re.I):
         keys.append(m.group(1))
-    # Direct S3 links if present
     for m in re.finditer(r'href="https://s3\.amazonaws\.com/tripdata/([^"]+)"', html, flags=re.I):
         keys.append(m.group(1))
-    return list(dict.fromkeys(keys))  # dedupe, preserve order
+    return list(dict.fromkeys(keys))
 
 def _head_exists(url: str, timeout: int = REQUEST_TIMEOUT) -> bool:
     try:
@@ -135,9 +120,6 @@ def _head_exists(url: str, timeout: int = REQUEST_TIMEOUT) -> bool:
         return False
 
 def _generate_recent_candidates(n_months: int) -> List[str]:
-    """
-    Guess recent filenames by pattern to bypass index if needed.
-    """
     today = datetime.utcnow().replace(day=1)
     names: List[str] = []
     y, m = today.year, today.month
@@ -178,11 +160,6 @@ def _urls_from_keys(keys: List[str], n_months: int) -> List[str]:
 
 @st.cache_data(show_spinner=False, ttl=6 * 3600)
 def list_citibike_recent_urls(max_months: int = 3) -> Tuple[List[str], str]:
-    """
-    Discover URLs for the most recent N monthly trip files.
-    Returns (urls, discovery_method).
-    Tries S3 index, then system-data page, then guessed filenames with HEAD validation.
-    """
     # Strategy A: S3 listing
     try:
         keys = _discover_from_s3(max_pages=15)
@@ -191,7 +168,6 @@ def list_citibike_recent_urls(max_months: int = 3) -> Tuple[List[str], str]:
             return urls, "S3 index"
     except Exception:
         pass
-
     # Strategy B: system-data page
     try:
         keys = _discover_from_system_data_page()
@@ -200,7 +176,6 @@ def list_citibike_recent_urls(max_months: int = 3) -> Tuple[List[str], str]:
             return urls, "System-data page"
     except Exception:
         pass
-
     # Strategy C: guess + HEAD
     candidates = _generate_recent_candidates(max_months)
     valid_keys: List[str] = []
@@ -213,7 +188,6 @@ def list_citibike_recent_urls(max_months: int = 3) -> Tuple[List[str], str]:
     urls = _urls_from_keys(valid_keys, max_months)
     if urls:
         return urls, "Guessed filenames (HEAD verified)"
-
     raise RuntimeError("Could not discover Citi Bike trip files (S3 listing blocked or site unavailable).")
 
 def _read_month_from_zip_bytes(b: bytes, usecols: Iterable[str]) -> pd.DataFrame:
@@ -233,10 +207,6 @@ def _read_month_from_url(url: str, usecols: Iterable[str]) -> pd.DataFrame:
     return pd.read_csv(io.BytesIO(r.content), low_memory=False, usecols=lambda c: c.lower() in {u.lower() for u in usecols})
 
 def _normalize_trip_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Standardize trip start timestamp into 'started_at' (datetime64[ns]),
-    handling schema variations.
-    """
     cols_lower = {c.lower(): c for c in df.columns}
     started_col = None
     for candidate in ["started_at", "starttime", "start_time", "start_time_local", "start_time_utc", "start time", "started at"]:
@@ -252,11 +222,7 @@ def _normalize_trip_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 @st.cache_data(show_spinner=True, ttl=6 * 3600)
-def fetch_citibike_recent_hourly(n_months: int = 3) -> Tuple[pd.DataFrame, str]:
-    """
-    Download the most recent N monthly Citi Bike trip files, normalize, and aggregate to hourly counts.
-    Returns (hourly_df, source_label).
-    """
+def fetch_citibike_recent_hourly(n_months: int = 3) -> Tuple[pd.DataFrame, str, List[str], str]:
     urls, method = list_citibike_recent_urls(n_months)
     if not urls:
         raise RuntimeError("No recent Citi Bike monthly files found.")
@@ -282,13 +248,70 @@ def fetch_citibike_recent_hourly(n_months: int = 3) -> Tuple[pd.DataFrame, str]:
         raise RuntimeError("No monthly data could be loaded. The files may have changed schema or were unreachable.")
     hourly = pd.concat(frames, ignore_index=True)
     hourly = hourly.groupby("ts", as_index=False)["cnt"].sum().sort_values("ts")
-    # Derivations
     hourly["date"] = hourly["ts"].dt.date
     hourly["hour"] = hourly["ts"].dt.hour
     hourly["weekday_name"] = hourly["ts"].dt.day_name()
     hourly["month"] = hourly["ts"].dt.to_period("M").astype(str)
     source = f"Citi Bike NYC — last {len(urls)} month(s), discovery: {method}"
-    return hourly, source
+    return hourly, source, urls, method
+
+# -----------------------------------------------
+# Weather (Open-Meteo)
+# -----------------------------------------------
+@st.cache_data(show_spinner=True, ttl=6 * 3600)
+def fetch_openmeteo_hourly(start_date: datetime.date, end_date: datetime.date) -> pd.DataFrame:
+    """
+    Fetch hourly weather for NYC (Open-Meteo archive) in local time.
+    Columns: ts, temp_c, precip_mm, windspeed_kmh, weathercode
+    """
+    params = {
+        "latitude": NYC_LAT,
+        "longitude": NYC_LON,
+        "start_date": start_date.strftime("%Y-%m-%d"),
+        "end_date": end_date.strftime("%Y-%m-%d"),
+        "hourly": "temperature_2m,precipitation,weathercode,windspeed_10m",
+        "timezone": NYC_TZ,
+    }
+    r = requests.get(OPEN_METEO_ARCHIVE, params=params, headers=UA, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    j = r.json()
+    hourly = j.get("hourly", {})
+    if not hourly or "time" not in hourly:
+        raise RuntimeError("Open-Meteo returned no hourly data.")
+    df = pd.DataFrame(hourly)
+    df["ts"] = pd.to_datetime(df["time"], errors="coerce")
+    if pd.api.types.is_datetime64tz_dtype(df["ts"]):
+        df["ts"] = df["ts"].dt.tz_convert(NYC_TZ).dt.tz_localize(None)
+    df.rename(
+        columns={
+            "temperature_2m": "temp_c",
+            "precipitation": "precip_mm",
+            "windspeed_10m": "windspeed_kmh",
+        },
+        inplace=True,
+    )
+    df = df[["ts", "temp_c", "precip_mm", "windspeed_kmh", "weathercode"]]
+    return df
+
+def _precip_bucket(v: float) -> str:
+    if pd.isna(v) or v <= 0.0:
+        return "No rain"
+    if v < 1.0:
+        return "Light (0–1mm/h)"
+    if v < 3.0:
+        return "Moderate (1–3mm/h)"
+    return "Heavy (≥3mm/h)"
+
+def _wind_bucket(v: float) -> str:
+    if pd.isna(v):
+        return "Unknown"
+    if v < 10:
+        return "<10 km/h"
+    if v < 20:
+        return "10–20 km/h"
+    if v < 30:
+        return "20–30 km/h"
+    return "≥30 km/h"
 
 # -----------------------------------------------
 # Page
@@ -297,14 +320,17 @@ st.set_page_config(page_title="Trends • RidePulse", page_icon="📈", layout="
 st.title("📈 Trip Trends (recent data)")
 
 with st.sidebar:
-    st.header("Data source")
-    st.caption("This view uses NYC Citi Bike monthly trip files aggregated to hourly counts.")
+    st.header("Options")
+    st.caption("NYC Citi Bike monthly trip files are aggregated to hourly counts.")
     months = st.slider("Months to load", min_value=1, max_value=6, value=3, help="More months = more data to download.")
+    join_weather = st.toggle("Join weather (Open‑Meteo)", value=True, help="Fetch hourly weather for NYC and enrich charts.")
 
 # Fetch + normalize
+urls_used: List[str] = []
+discovery_method = ""
 try:
     with st.spinner("Loading latest Citi Bike trips…"):
-        trips, source_label = fetch_citibike_recent_hourly(n_months=months)
+        trips, source_label, urls_used, discovery_method = fetch_citibike_recent_hourly(n_months=months)
 except Exception as e:
     st.error(f"Could not fetch data: {e}")
     st.info("Please try again later.")
@@ -339,6 +365,16 @@ with c2:
 mask = (trips["date"] >= date_range[0]) & (trips["date"] <= date_range[1])
 trips = trips.loc[mask].copy()
 
+# Optionally join weather for the selected window
+weather = pd.DataFrame()
+if join_weather:
+    try:
+        with st.spinner("Fetching weather (Open‑Meteo)…"):
+            weather = fetch_openmeteo_hourly(date_range[0], date_range[1])
+        trips = trips.merge(weather, on="ts", how="left")
+    except Exception as e:
+        st.warning(f"Weather unavailable: {e}")
+
 # KPIs
 by_day = trips.groupby("date", as_index=False)["cnt"].sum().sort_values("date")
 rides_total = int(by_day["cnt"].sum())
@@ -354,10 +390,14 @@ with k3:
     st.metric("Most common weekday in range", wkday)
 
 # Tabs
-tab_sys, tab_profiles = st.tabs(["System trends", "Usage profiles"])
+tabs_labels = ["System trends", "Usage profiles"]
+if join_weather and not weather.empty:
+    tabs_labels.append("Weather effects")
+tabs_labels.append("Anomalies")
+tabs = st.tabs(tabs_labels)
 
 # -------- System trends --------
-with tab_sys:
+with tabs[0]:
     st.subheader("System trends")
     if not by_day.empty:
         by_day["trend_7d"] = by_day["cnt"].rolling(7, min_periods=1).mean()
@@ -389,7 +429,7 @@ with tab_sys:
         st.caption("Seasonal differences across months. Taller boxes/whiskers indicate more variability in hourly rides.")
 
 # -------- Usage profiles --------
-with tab_profiles:
+with tabs[1]:
     st.subheader("Usage profiles")
 
     cA, cB = st.columns(2)
@@ -430,9 +470,112 @@ with tab_profiles:
         st.write("What this shows")
         st.caption("When during the week riding is most intense. Bright cells = busier periods.")
 
+# -------- Weather effects --------
+tab_idx = 2
+if join_weather and not weather.empty:
+    with tabs[tab_idx]:
+        st.subheader("Weather effects")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            df = trips[["temp_c", "cnt"]].dropna()
+            if not df.empty:
+                if len(df) > 30_000:
+                    df = df.sample(30_000, random_state=42)
+                fig_sc = px.scatter(df, x="temp_c", y="cnt", opacity=0.4, trendline=None,
+                                    title="Rides vs temperature (hourly)")
+                fig_sc.update_traces(marker=dict(color="#60a5fa"))
+                fig_sc.update_layout(height=360, xaxis_title="Temp (°C)", yaxis_title="Rides/hour")
+                st.plotly_chart(_apply_theme(fig_sc), use_container_width=True, theme="streamlit")
+            else:
+                st.info("No temp/ride overlap available.")
+
+        with c2:
+            dfp = trips[["precip_mm", "cnt"]].copy()
+            if not dfp.empty:
+                dfp["rain_bin"] = dfp["precip_mm"].apply(_precip_bucket)
+                by_rain = dfp.groupby("rain_bin", as_index=False)["cnt"].median()
+                order = ["No rain", "Light (0–1mm/h)", "Moderate (1–3mm/h)", "Heavy (≥3mm/h)"]
+                by_rain["rain_bin"] = pd.Categorical(by_rain["rain_bin"], order, ordered=True)
+                by_rain = by_rain.sort_values("rain_bin")
+                fig_r = px.bar(by_rain, x="rain_bin", y="cnt", title="Ridership by rain intensity (median)")
+                fig_r.update_traces(marker_color="#60a5fa")
+                fig_r.update_layout(height=360, xaxis_title="Rain", yaxis_title="Rides/hour")
+                st.plotly_chart(_apply_theme(fig_r), use_container_width=True, theme="streamlit")
+            else:
+                st.info("No precipitation/ride overlap available.")
+
+        c3, c4 = st.columns(2)
+        with c3:
+            dfw = trips[["windspeed_kmh", "cnt"]].copy()
+            if not dfw.empty:
+                dfw["wind_bin"] = dfw["windspeed_kmh"].apply(_wind_bucket)
+                by_w = dfw.groupby("wind_bin", as_index=False)["cnt"].median()
+                order_w = ["<10 km/h", "10–20 km/h", "20–30 km/h", "≥30 km/h", "Unknown"]
+                by_w["wind_bin"] = pd.Categorical(by_w["wind_bin"], order_w, ordered=True)
+                by_w = by_w.sort_values("wind_bin")
+                fig_w = px.bar(by_w, x="wind_bin", y="cnt", title="Ridership by wind speed (median)")
+                fig_w.update_traces(marker_color="#60a5fa")
+                fig_w.update_layout(height=320, xaxis_title="Wind", yaxis_title="Rides/hour")
+                st.plotly_chart(_apply_theme(fig_w), use_container_width=True, theme="streamlit")
+
+        with c4:
+            dfm = trips[["cnt", "temp_c", "precip_mm", "windspeed_kmh"]].dropna()
+            if len(dfm) > 200:
+                X = np.column_stack([
+                    np.ones(len(dfm)),
+                    dfm["temp_c"].to_numpy(),
+                    dfm["precip_mm"].to_numpy(),
+                    dfm["windspeed_kmh"].to_numpy(),
+                ])
+                y = dfm["cnt"].to_numpy()
+                try:
+                    coef, *_ = np.linalg.lstsq(X, y, rcond=None)
+                    y_hat = X @ coef
+                    idx = (y / np.maximum(y_hat, 1e-6)) * 100.0
+                    dfm = dfm.assign(index=np.clip(idx, 50, 150))
+                    by_d = dfm.groupby(trips.loc[dfm.index, "date"])["index"].median().reset_index(name="Index")
+                    fig_idx = px.line(by_d, x="date", y="Index", title="Weather-adjusted ridership index (median)")
+                    fig_idx.add_hline(y=100, line_dash="dot", line_color="#10b981")
+                    fig_idx.update_layout(height=320, yaxis_title="Index (100 = expected)")
+                    st.plotly_chart(_apply_theme(fig_idx), use_container_width=True, theme="streamlit")
+                except Exception:
+                    st.info("Not enough stable data to build a weather-adjusted index.")
+
+    tab_idx += 1
+
+# -------- Anomalies (daily vs seasonal baseline) --------
+with tabs[tab_idx]:
+    st.subheader("Anomalies")
+    if not by_day.empty:
+        by_day["weekday"] = pd.to_datetime(by_day["date"]).dt.day_name()
+        by_day["baseline"] = by_day.groupby("weekday")["cnt"].transform(lambda s: s.rolling(7, min_periods=3).median())
+        by_day["delta"] = by_day["cnt"] - by_day["baseline"]
+        by_day["pct"] = 100.0 * by_day["delta"] / by_day["baseline"]
+        fig_an = go.Figure()
+        fig_an.add_trace(go.Bar(x=by_day["date"], y=by_day["delta"], name="Delta vs baseline",
+                                marker_color=np.where(by_day["delta"] >= 0, "#10b981", "#ef4444")))
+        fig_an.update_layout(height=360, xaxis_title="Date", yaxis_title="Rides vs expected (Δ)",
+                             showlegend=False)
+        st.plotly_chart(_apply_theme(fig_an), use_container_width=True, theme="streamlit")
+
+        top_k = 10
+        col1, col2 = st.columns(2)
+        with col1:
+            up = by_day.nlargest(top_k, "delta")[["date", "cnt", "baseline", "delta", "pct"]]
+            st.write(f"Top {top_k} positive anomalies")
+            st.dataframe(up, use_container_width=True)
+        with col2:
+            dn = by_day.nsmallest(top_k, "delta")[["date", "cnt", "baseline", "delta", "pct"]]
+            st.write(f"Top {top_k} negative anomalies")
+            st.dataframe(dn, use_container_width=True)
+    else:
+        st.info("Not enough data to compute anomalies.")
+
 st.markdown("---")
 st.subheader("Notes")
 st.write(
     "- Source: Citi Bike monthly trip history (public S3). We aggregate to hourly counts for recent months.\n"
-    "- If data discovery fails (e.g., S3 listing blocked), please try again later."
+    "- Weather: Open‑Meteo archive (temperature, precipitation, wind) joined on local hourly timestamps.\n"
+    "- Anomalies are computed vs a weekday-based rolling median baseline; they are indicative, not causal."
 )
