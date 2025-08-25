@@ -38,7 +38,7 @@ with st.expander("Input guide (what you need to choose)", expanded=True):
         """
     )
 
-st.caption("Uses the live GBFS station data already in the project. No uploads needed.")
+st.caption("Uses the live GBFS station data.")
 
 # Sidebar controls
 with st.sidebar:
