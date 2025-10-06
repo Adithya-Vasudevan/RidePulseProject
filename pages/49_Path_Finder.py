@@ -10,31 +10,13 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
+from utils.ui import apply_theme, set_mapbox_key_from_secrets
+
 UA = {"User-Agent": "RidePulse/1.0 (+https://github.com/Adithya-Vasudevan)"}
 REQUEST_TIMEOUT = 30
 
 GBFS_INFO = "https://gbfs.citibikenyc.com/gbfs/en/station_information.json"
 GBFS_STATUS = "https://gbfs.citibikenyc.com/gbfs/en/station_status.json"
-
-# ---------- Theme ----------
-def _is_dark() -> bool:
-    try:
-        return st.get_option("theme.base") == "dark"
-    except Exception:
-        return True
-
-def _apply_theme(fig: go.Figure) -> go.Figure:
-    dark = _is_dark()
-    font_color = "#C9D1D9" if dark else "#111827"
-    grid_color = "#30363d" if dark else "#e5e7eb"
-    fig.update_layout(
-        template="plotly_dark" if dark else "plotly_white",
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(color=font_color),
-        margin=dict(l=20, r=20, t=20, b=20),
-    )
-    return fig
 
 # ---------- Helpers ----------
 def haversine_km(lat1: np.ndarray, lon1: np.ndarray, lat2: np.ndarray, lon2: np.ndarray) -> np.ndarray:
@@ -99,7 +81,7 @@ class GraphData:
     edges: List[Tuple[str, str, float]]  # (u, v, base_km)
     adjacency: Dict[str, List[Tuple[str, float]]]
 
-@st.cache_resource(show_spinner=True)
+@st.cache_data(ttl=120, show_spinner=True)
 def build_station_graph(stations_in: pd.DataFrame, data_sig: Tuple, cfg: GraphConfig) -> GraphData:
     """
     Vectorized k-NN graph builder with distance-based edges.
@@ -274,6 +256,9 @@ def dijkstra_generic(
 st.set_page_config(page_title="Path Finder • RidePulse", page_icon="🧭", layout="wide")
 st.title("🧭 Path Finder (NYC Citi Bike)")
 
+# Set up Mapbox key from secrets if available
+set_mapbox_key_from_secrets()
+
 # Read deep-linking params
 qp = st.query_params
 qp_src = qp.get("src")
@@ -294,6 +279,7 @@ with st.sidebar:
     c1, c2 = st.columns(2)
     with c1:
         use_only_online = st.toggle("Only active", value=True, help="Only include installed, renting stations with bike availability.")
+        accessibility_mode = st.toggle("Accessibility", value=False, help="Larger text and thicker lines for better readability.")
     with c2:
         show_edges = st.toggle("Show edges", value=False, help="Render base graph edges (can be heavy).")
 
@@ -431,10 +417,11 @@ if show_edges and len(graph.edges) > 0:
     ))
 
 # Stations
+marker_size = 8 if accessibility_mode else 6
 fig.add_trace(go.Scattermapbox(
     lon=graph.stations["lon"], lat=graph.stations["lat"],
     mode="markers",
-    marker=dict(size=6, color="#3b82f6"),
+    marker=dict(size=marker_size, color="#3b82f6"),
     text=graph.stations["name"],
     hoverinfo="text",
     name="Stations",
@@ -443,11 +430,13 @@ fig.add_trace(go.Scattermapbox(
 # Path overlay
 if path_ids:
     pts = graph.stations.set_index("station_id").loc[path_ids][["lon", "lat"]]
+    path_line_width = 5 if accessibility_mode else 4
+    path_marker_size = 10 if accessibility_mode else 8
     fig.add_trace(go.Scattermapbox(
         lon=pts["lon"], lat=pts["lat"],
         mode="lines+markers",
-        line=dict(width=4, color="#10b981"),
-        marker=dict(size=8, color="#10b981"),
+        line=dict(width=path_line_width, color="#10b981"),
+        marker=dict(size=path_marker_size, color="#10b981"),
         name="Best path",
     ))
 
@@ -460,7 +449,7 @@ fig.update_layout(
     height=560,
     legend=dict(orientation="h", yanchor="bottom", y=0.01, x=0.01),
 )
-st.plotly_chart(_apply_theme(fig), use_container_width=True, theme="streamlit")
+st.plotly_chart(apply_theme(fig, a11y=accessibility_mode), use_container_width=True, theme="streamlit")
 
 # Metrics
 m1, m2, m3 = st.columns(3)

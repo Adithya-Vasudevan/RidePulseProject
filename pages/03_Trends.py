@@ -14,6 +14,8 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
+from utils.ui import apply_theme
+
 # -----------------------------------------------
 # Constants
 # -----------------------------------------------
@@ -29,30 +31,6 @@ CITIBIKE_SYSTEM_DATA = "https://ride.citibikenyc.com/system-data"
 OPEN_METEO_ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
 NYC_LAT, NYC_LON = 40.7128, -74.0060
 NYC_TZ = "America/New_York"
-
-# -----------------------------------------------
-# Theme helpers
-# -----------------------------------------------
-def _is_dark() -> bool:
-    try:
-        return st.get_option("theme.base") == "dark"
-    except Exception:
-        return True
-
-def _apply_theme(fig: go.Figure) -> go.Figure:
-    dark = _is_dark()
-    font_color = "#C9D1D9" if dark else "#111827"
-    grid_color = "#30363d" if dark else "#e5e7eb"
-    fig.update_layout(
-        template="plotly_dark" if dark else "plotly_white",
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(color=font_color),
-        xaxis=dict(gridcolor=grid_color, zerolinecolor=grid_color),
-        yaxis=dict(gridcolor=grid_color, zerolinecolor=grid_color),
-        margin=dict(l=20, r=20, t=50, b=30),
-    )
-    return fig
 
 # -----------------------------------------------
 # Citi Bike discovery + loading
@@ -324,6 +302,7 @@ with st.sidebar:
     st.caption("NYC Citi Bike monthly trip files are aggregated to hourly counts.")
     months = st.slider("Months to load", min_value=1, max_value=6, value=3, help="More months = more data to download.")
     join_weather = st.toggle("Join weather (Open‑Meteo)", value=True, help="Fetch hourly weather for NYC and enrich charts.")
+    accessibility_mode = st.toggle("Accessibility mode", value=False, help="Larger text and thicker lines for better readability.")
 
 # Fetch + normalize
 urls_used: List[str] = []
@@ -401,6 +380,16 @@ with tabs[0]:
     st.subheader("System trends")
     if not by_day.empty:
         by_day["trend_7d"] = by_day["cnt"].rolling(7, min_periods=1).mean()
+        
+        # Add CSV export for daily data
+        daily_csv = by_day.to_csv(index=False)
+        st.download_button(
+            label="📥 Download daily data (CSV)",
+            data=daily_csv,
+            file_name=f"citibike_daily_{date_range[0]}_{date_range[1]}.csv",
+            mime="text/csv",
+        )
+        
         fig_daily = go.Figure()
         fig_daily.add_trace(go.Bar(x=by_day["date"], y=by_day["cnt"], name="Rides per day",
                                    marker_color="#60a5fa", opacity=0.6))
@@ -413,7 +402,7 @@ with tabs[0]:
             height=360,
             legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0.01),
         )
-        st.plotly_chart(_apply_theme(fig_daily), use_container_width=True, theme="streamlit")
+        st.plotly_chart(apply_theme(fig_daily, a11y=accessibility_mode), use_container_width=True, theme="streamlit")
         with st.container(border=True):
             st.write("What this shows")
             st.caption("Daily ride volume and a 7-day moving average to reveal the underlying trend and seasonality.")
@@ -423,7 +412,7 @@ with tabs[0]:
                    labels={"month_lbl": "Month", "cnt": "Rides per hour"},
                    title="Monthly seasonality (distribution of hourly rides)")
     fig_m.update_layout(height=360)
-    st.plotly_chart(_apply_theme(fig_m), use_container_width=True, theme="streamlit")
+    st.plotly_chart(apply_theme(fig_m, a11y=accessibility_mode), use_container_width=True, theme="streamlit")
     with st.container(border=True):
         st.write("What this shows")
         st.caption("Seasonal differences across months. Taller boxes/whiskers indicate more variability in hourly rides.")
@@ -431,13 +420,22 @@ with tabs[0]:
 # -------- Usage profiles --------
 with tabs[1]:
     st.subheader("Usage profiles")
+    
+    # Add CSV export for hourly data
+    hourly_csv = trips.to_csv(index=False)
+    st.download_button(
+        label="📥 Download hourly data (CSV)",
+        data=hourly_csv,
+        file_name=f"citibike_hourly_{date_range[0]}_{date_range[1]}.csv",
+        mime="text/csv",
+    )
 
     cA, cB = st.columns(2)
     with cA:
         hour_prof = trips.groupby("hour", as_index=False)["cnt"].median()
         fig_hr = px.line(hour_prof, x="hour", y="cnt", markers=True, title="Intraday profile (median rides by hour)")
         fig_hr.update_layout(height=320, xaxis_title="Hour", yaxis_title="Rides (median)")
-        st.plotly_chart(_apply_theme(fig_hr), use_container_width=True, theme="streamlit")
+        st.plotly_chart(apply_theme(fig_hr, a11y=accessibility_mode), use_container_width=True, theme="streamlit")
         with st.container(border=True):
             st.write("What this shows")
             st.caption("Typical intraday shape: commuting peaks vs mid-day/evening usage.")
@@ -450,7 +448,7 @@ with tabs[1]:
         fig_dow = px.bar(dow_prof, x="weekday_name", y="cnt", title="Day-of-week profile (median rides per hour)")
         fig_dow.update_traces(marker_color="#60a5fa")
         fig_dow.update_layout(height=320, xaxis_title="Weekday", yaxis_title="Rides (median)")
-        st.plotly_chart(_apply_theme(fig_dow), use_container_width=True, theme="streamlit")
+        st.plotly_chart(apply_theme(fig_dow, a11y=accessibility_mode), use_container_width=True, theme="streamlit")
         with st.container(border=True):
             st.write("What this shows")
             st.caption("Differences between weekdays and weekends.")
@@ -465,7 +463,7 @@ with tabs[1]:
     fig_heat = px.imshow(heat_wide, color_continuous_scale="Turbo", aspect="auto", origin="lower",
                          title="Heatmap: rides by hour and weekday (median)")
     fig_heat.update_layout(height=420, coloraxis_colorbar=dict(title="Rides"))
-    st.plotly_chart(_apply_theme(fig_heat), use_container_width=True, theme="streamlit")
+    st.plotly_chart(apply_theme(fig_heat, a11y=accessibility_mode), use_container_width=True, theme="streamlit")
     with st.container(border=True):
         st.write("What this shows")
         st.caption("When during the week riding is most intense. Bright cells = busier periods.")
@@ -486,7 +484,7 @@ if join_weather and not weather.empty:
                                     title="Rides vs temperature (hourly)")
                 fig_sc.update_traces(marker=dict(color="#60a5fa"))
                 fig_sc.update_layout(height=360, xaxis_title="Temp (°C)", yaxis_title="Rides/hour")
-                st.plotly_chart(_apply_theme(fig_sc), use_container_width=True, theme="streamlit")
+                st.plotly_chart(apply_theme(fig_sc, a11y=accessibility_mode), use_container_width=True, theme="streamlit")
             else:
                 st.info("No temp/ride overlap available.")
 
@@ -501,7 +499,7 @@ if join_weather and not weather.empty:
                 fig_r = px.bar(by_rain, x="rain_bin", y="cnt", title="Ridership by rain intensity (median)")
                 fig_r.update_traces(marker_color="#60a5fa")
                 fig_r.update_layout(height=360, xaxis_title="Rain", yaxis_title="Rides/hour")
-                st.plotly_chart(_apply_theme(fig_r), use_container_width=True, theme="streamlit")
+                st.plotly_chart(apply_theme(fig_r, a11y=accessibility_mode), use_container_width=True, theme="streamlit")
             else:
                 st.info("No precipitation/ride overlap available.")
 
@@ -517,7 +515,7 @@ if join_weather and not weather.empty:
                 fig_w = px.bar(by_w, x="wind_bin", y="cnt", title="Ridership by wind speed (median)")
                 fig_w.update_traces(marker_color="#60a5fa")
                 fig_w.update_layout(height=320, xaxis_title="Wind", yaxis_title="Rides/hour")
-                st.plotly_chart(_apply_theme(fig_w), use_container_width=True, theme="streamlit")
+                st.plotly_chart(apply_theme(fig_w, a11y=accessibility_mode), use_container_width=True, theme="streamlit")
 
         with c4:
             dfm = trips[["cnt", "temp_c", "precip_mm", "windspeed_kmh"]].dropna()
@@ -538,7 +536,7 @@ if join_weather and not weather.empty:
                     fig_idx = px.line(by_d, x="date", y="Index", title="Weather-adjusted ridership index (median)")
                     fig_idx.add_hline(y=100, line_dash="dot", line_color="#10b981")
                     fig_idx.update_layout(height=320, yaxis_title="Index (100 = expected)")
-                    st.plotly_chart(_apply_theme(fig_idx), use_container_width=True, theme="streamlit")
+                    st.plotly_chart(apply_theme(fig_idx, a11y=accessibility_mode), use_container_width=True, theme="streamlit")
                 except Exception:
                     st.info("Not enough stable data to build a weather-adjusted index.")
 
@@ -557,7 +555,7 @@ with tabs[tab_idx]:
                                 marker_color=np.where(by_day["delta"] >= 0, "#10b981", "#ef4444")))
         fig_an.update_layout(height=360, xaxis_title="Date", yaxis_title="Rides vs expected (Δ)",
                              showlegend=False)
-        st.plotly_chart(_apply_theme(fig_an), use_container_width=True, theme="streamlit")
+        st.plotly_chart(apply_theme(fig_an, a11y=accessibility_mode), use_container_width=True, theme="streamlit")
 
         top_k = 10
         col1, col2 = st.columns(2)
